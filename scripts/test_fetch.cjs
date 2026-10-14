@@ -1,0 +1,20 @@
+'use strict';
+const assert=require('node:assert/strict');
+const {test}=require('node:test');
+const {oneYearStart,months,parseResponse,mergeRows}=require('./fetch_history.cjs');
+const header='|证券代码|日期|开盘价|最高价|最低价|收盘价|\n|---|---|---|---|---|---|\n';
+const options={symbol:'000792.SZ',from:'2026-10-12',to:'2026-10-13'};
+const row=(date,close='10',symbol='000792.SZ')=>`|${symbol}|${date}|10|11|9|${close}|`;
+function raw(text,params={}){return {ok:true,data:{result:{content:[{type:'text',text:JSON.stringify({code:1,data:{answer:text,indicators_params:params}})}]}}};}
+test('natural calendar year and leap date clamp',()=>{assert.equal(oneYearStart('2026-10-13'),'2025-10-14');assert.equal(oneYearStart('2024-02-29'),'2023-03-01');assert.equal(months('2025-10-14','2026-10-13').length,13);});
+test('daily values sorted and exact-symbol alias ignored',()=>{const x=parseResponse(raw(header+row('20261013')+'\n'+row('20261012')+'\n'+row('20261012','55','518880.SH')),options);assert.deepEqual(x.rows.map(r=>r.date),['20261012','20261013']);assert.deepEqual(x.excludedSymbols,['518880.SH']);});
+test('cross-symbol-only response cannot pass completeness',()=>assert.throws(()=>parseResponse(raw(header+row('20261012','10','518880.SH')+'\n'+row('20261013','10','518880.SH')),options),/coverage/));
+test('interval minimum cannot masquerade as daily low',()=>assert.throws(()=>parseResponse(raw((header+row('20261012')+'\n'+row('20261013')).replace('最低价','区间最低价')),options),/Interval/));
+test('adjusted prices rejected',()=>assert.throws(()=>parseResponse(raw(header+row('20261012')+'\n'+row('20261013'),{'收盘价':{'复权方式':'前复权'}}),options),/Adjusted/));
+test('conflicting duplicates rejected, identical duplicates accepted',()=>{assert.throws(()=>parseResponse(raw(header+row('20261012')+'\n'+row('20261012','10.1')+'\n'+row('20261013')),options),/Conflicting/);assert.equal(parseResponse(raw(header+row('20261012')+'\n'+row('20261012')+'\n'+row('20261013')),options).duplicateCount,1);});
+test('weekday missing OHLC explicitly requires review and is never filled',()=>{const x=parseResponse(raw(header+row('20261012')+'\n|000792.SZ|20261013||||10|'),options);assert.equal(x.rows.length,1);assert.equal(x.skipped[0].kind,'weekday_missing_ohlc_requires_review');assert.deepEqual(x.skipped[0].missing,['open','high','low']);});
+test('trading-day-only response without calendar cannot pass',()=>assert.throws(()=>parseResponse(raw(header+row('20261012')),options),/coverage/));
+test('future selected row rejected even outside requested dates',()=>assert.throws(()=>parseResponse(raw(header+row('20261012')+'\n'+row('20261013')+'\n'+row('20261014')),options),/Future/));
+test('malformed numbers and broken OHLC fail',()=>{assert.throws(()=>parseResponse(raw(header+row('20261012','Infinity')+'\n'+row('20261013')),options),/Malformed/);assert.throws(()=>parseResponse(raw(header+row('20261012','12')+'\n'+row('20261013')),options),/Inconsistent/);});
+test('covering monthly raw clips and records earlier dates',()=>{const x=parseResponse(raw(header+row('20261011')+'\n'+row('20261012')+'\n'+row('20261013')),options);assert.deepEqual(x.outsideRequestedRange,['20261011']);});
+test('cross-batch duplicate conflicts fail',()=>assert.throws(()=>mergeRows([[{date:'20261012',close:1}],[{date:'20261012',close:2}]]),/Conflicting/));
