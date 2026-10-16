@@ -1,9 +1,9 @@
 """Daily artificial-path stock / ETF grid experiment with settlement rules.
 
-No brokerage execution. Terminal equity may contain unsold stock when a one-price
-bar blocks liquidation; inspect fully_liquidated instead of assuming all P&L is
-realized. Dividend receipt dates are unknown: net receivables are valued during
-the run and hypothetically settled at its end, never spent before then.
+No brokerage execution. liquidate_end=False runs one continuous marked-to-market
+segment: only its first day enters, and its final observation does not close
+positions or settle dividend receivables. The library default True preserves
+older terminal-liquidation callers; the primary study CLI explicitly uses False.
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,7 +18,7 @@ class Config:
     budget: float = 20000
     initial_fraction: float = .5
     min_fraction: float = .25
-    max_fraction: float = .8
+    max_fraction: float = 1.
     grid: float = .015
     lot: int = 100
     fee_rate: float = .0001
@@ -58,7 +58,8 @@ def validate_bars(bars, tick=.01):
         if not l<=min(o,c)<=max(o,c)<=h:raise ValueError('Inconsistent OHLC')
 
 
-def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
+def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None,*,liquidate_end=True):
+    if not isinstance(liquidate_end,bool):raise ValueError('liquidate_end must be a boolean')
     if cfg.kind not in ("stock", "etf-t0", "etf-t1"):
         raise ValueError("Asset settlement must be explicitly confirmed")
     tick=.01 if cfg.kind=="stock" else .001
@@ -121,7 +122,7 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
         px,notional,fee,stamp,transfer=quote(side,p,n)
         cost=fee+stamp+transfer
         if side=='buy':
-            if last_day and t1:raise ValueError('Final-day buying is forbidden under T+1')
+            if liquidate_end and last_day and t1:raise ValueError('Final-day buying is forbidden for T+1 terminal liquidation')
             if notional+cost>cash+1e-8:raise ValueError('Insufficient available cash')
             cash=money(cash-notional-cost);qty+=n
             if not t1:sellable+=n
@@ -145,7 +146,7 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
         return stopped
 
     def can_buy(p):
-        if stopped or (last_day and t1) or not tradable or qty+cfg.lot>cap:return False
+        if stopped or (liquidate_end and last_day and t1) or not tradable or qty+cfg.lot>cap:return False
         _,value,fee,stamp,transfer=quote('buy',p,cfg.lot)
         return value+fee+stamp+transfer<=cash+1e-8
 
@@ -196,7 +197,8 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
     def snapshot(bar):
         return dict(date=bar['date'],equity=mark(bar['close']),quantity=qty,cash=cash,
                     sellable_quantity=sellable,locked_quantity=qty-sellable,
-                    dividend_receivable=receivable,stopped=stopped,tradable=tradable)
+                    dividend_receivable=receivable,reference_price=ref,
+                    stopped=stopped,tradable=tradable)
 
     tradable=not blocked(bars[0])
     entry_blocked=not tradable and policy!='cash'
@@ -225,8 +227,9 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
             points=[bar[k] for k in (('open','high','low','close') if path=='OHLC' else ('open','low','high','close'))]
             for a,b in zip(points,points[1:]):segment(a,b,date)
         daily.append(snapshot(bar))
-    if qty and tradable and sellable:fill('sell',bars[-1]['close'],sellable,bars[-1]['date'],'exit')
-    if receivable:
+    if liquidate_end and qty and tradable and sellable:
+        fill('sell',bars[-1]['close'],sellable,bars[-1]['date'],'exit')
+    if liquidate_end and receivable:
         events.append(dict(date=bars[-1]['date'],event='assumed_terminal_dividend_settlement',amount=receivable))
         cash=money(cash+receivable);receivable=0.
     daily[-1]=snapshot(bars[-1])
@@ -234,7 +237,11 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
     returns=[b/a-1 for a,b in zip(equities,equities[1:])]
     variance=statistics.variance(returns)*252 if len(returns)>1 else 0
     vol=math.sqrt(variance)
-    metrics=dict(pnl=equities[-1]-cfg.budget,return_pct=(equities[-1]/cfg.budget-1)*100,
+    metrics=dict(initial_capital=cfg.budget,
+        terminal_valuation='liquidation' if liquidate_end else 'mark_to_market',
+        terminal_equity=equities[-1],ending_cash=cash,
+        ending_market_value=money(qty*bars[-1]['close']),dividend_receivable=receivable,
+        pnl=equities[-1]-cfg.budget,return_pct=(equities[-1]/cfg.budget-1)*100,
         annual_vol_pct=vol*100,annual_variance=variance,
         sharpe_zero_rf=statistics.mean(returns)*252/vol if vol>1e-12 else 0,
         max_drawdown_pct=maxdd*100,worst_initial_loss_pct=(1-min_equity/cfg.budget)*100,
@@ -250,7 +257,7 @@ def run(bars,cfg=Config(),path='OHLC',policy='grid',dividends=None):
         pending_stop_quantity=qty if stopped else 0,entry_blocked=entry_blocked)
     return dict(metrics=metrics,daily=daily,trades=trades,events=events,
         initial_quantity=initial_qty,min_quantity=floor,max_quantity=cap,
-        limitations=limitations(cfg))
+        limitations=limitations(cfg,liquidate_end=liquidate_end))
 
 
 
@@ -266,16 +273,21 @@ def default_config(kind, **overrides):
     return replace(base,**overrides)
 
 
-def limitations(cfg):
-    return [
+def limitations(cfg,*,liquidate_end=False):
+    mode=(
+        '显式期末清仓模式：整段首日建仓，末日尝试卖出可卖持仓；T+1末日禁买，分红应收期末假设到账。受阻时仍可能留仓。'
+        if liquidate_end else
+        '连续盯市模式：仅整段首日建仓，末日不强制清仓也不禁止买入；仓位、现金和基准价跨日延续，统计窗口不得重启引擎。'
+    )
+    return [mode,
         '样本内历史比较；日线OHLC/OLHC是人工路径，不是真实成交或盈亏上下界。',
-        '每轮总权益含现金、持仓浮盈亏和分红应收；每轮盈亏不是每格利润。',
-        '每轮独立建仓，期末尝试清仓，开盘跳空只成交一格；现金不生息。',
-        '所有一字价、零成交量和显式停牌日不假定成交；初始建仓阻塞则该轮现金，期末可能留仓。',
-        'T+0当日买入可卖。T+1只能卖隔夜库存，末日禁买；止损锁仓须下一可成交日开盘续卖。',
-        '止损按初始资本比例，含底仓全清且当轮不重启；不是净值高点回撤限制，跳空可穿透阈值。',
+        '总权益含现金、持仓浮盈亏和分红应收；期间盈亏不是每格利润，盯市利润不代表已实现收益。',
+        '开盘跳空只成交一格；现金不生息。',
+        '所有一字价、零成交量和显式停牌日不假定成交；初始建仓阻塞则本次运行保持现金。',
+        'T+0当日买入可卖。T+1只能卖隔夜库存；本金止损先卖旧仓，锁定新仓须下一可成交日开盘续卖，可能继续亏损。',
+        '止损按初始资本比例，含底仓全清且本次运行不重启；不是净值高点回撤限制，跳空可穿透阈值。',
         '股票计卖出印花税及双边过户费；ETF均不计。各笔费用四舍五入至分，另计不利滑点。',
-        '现金分红按除息日隔夜股数记应收；股票保守预扣20%，ETF默认现金分红免税。应收期间不可用于买入，期末假设到账。',
+        '现金分红按除息日隔夜股数记应收；股票保守预扣20%，ETF默认现金分红免税。到账日期未知，应收不可用于买入；连续模式末日仍保持应收。',
         '现金分红不自动调整网格基准及区间；不支持送转、拆股等其他公司行动。',
         '价格区间外停止新增网格交易，返回区间可恢复；部分成交、非一字涨跌停排队和APP延迟未模拟。',
         '券商APP若没有总权益止损/最大持仓功能，则无法完整复现研究规则；配置不是交易委托。',
