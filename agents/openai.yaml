@@ -1,4 +1,4 @@
 interface:
   display_name: "网格参数研究"
-  short_description: "按一年内固定六十日周期比较股票与ETF网格收益和方差并生成配置"
-  default_prompt: "用 $grid-trading-research 研究这个股票或ETF，给出候选范围内的网格最优参数和配置。"
+  short_description: "依据震荡阶段连续回测网格按价格往返自适应统计窗口并生成配置"
+  default_prompt: "用 $grid-trading-research 先判断这个票的震荡阶段，再连续回测并给出候选最优网格参数。"
